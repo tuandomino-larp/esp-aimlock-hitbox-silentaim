@@ -1,0 +1,391 @@
+--[[
+    Tuandomino Hack
+    ESP + Silent Aim + AimLock + Hitbox
+    target: Roblox (Delta executor, mobile)
+    unload: getgenv().TD_Unload() or re-execute
+]]
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui    = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+local Mouse       = LocalPlayer:GetMouse()
+
+--// ===== SETTINGS =====
+local SETTINGS = {
+    ESP           = true,
+    SilentAim     = true,
+    AimLock       = false,
+    Hitbox        = false,
+    TeamCheck     = false,
+    AimPart       = "Head",
+    FOV           = 250,
+    AimSmoothness = 0.25,
+    HitboxScale   = 2.0,
+    ShowHitbox    = false,
+    ESPColor      = Color3.fromRGB(0, 255, 255),
+    TextColor     = Color3.fromRGB(255, 255, 255),
+    HealthColor   = Color3.fromRGB(0, 255, 0),
+}
+
+local HITBOX_PARTS = {
+    Head = true,
+    Torso = true,
+    UpperTorso = true,
+    LowerTorso = true,
+    HumanoidRootPart = true,
+}
+
+--// ===== STATE =====
+if getgenv().TD_Unload then pcall(getgenv().TD_Unload) end
+
+local Connections  = {}
+local ESPCache     = {}
+local Running      = true
+local CachedTarget = nil
+local HoldingAim   = false
+
+local function addConn(c) table.insert(Connections, c); return c end
+
+--// ===== ESP =====
+local function newESP(plr)
+    if plr == LocalPlayer or ESPCache[plr] then return end
+    local box  = Drawing.new("Square")
+    local name = Drawing.new("Text")
+    local dist = Drawing.new("Text")
+    local hp   = Drawing.new("Square")
+    box.Thickness, box.Filled, box.Visible = 1, false, false
+    name.Size, name.Center, name.Outline, name.Visible = 14, true, true, false
+    dist.Size, dist.Center, dist.Outline, dist.Visible = 12, true, true, false
+    hp.Thickness, hp.Filled, hp.Visible = 1, true, false
+    ESPCache[plr] = { box = box, name = name, dist = dist, hp = hp }
+end
+
+local function removeESP(plr)
+    local e = ESPCache[plr]
+    if not e then return end
+    for _, obj in pairs(e) do pcall(function() obj:Remove() end) end
+    ESPCache[plr] = nil
+end
+
+local function hideAll(e)
+    e.box.Visible, e.name.Visible, e.dist.Visible, e.hp.Visible = false, false, false, false
+end
+
+local function updateESP()
+    for plr, e in pairs(ESPCache) do
+        if not SETTINGS.ESP then hideAll(e); continue end
+        local char = plr.Character
+        if not char then hideAll(e); continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local head = char:FindFirstChild("Head")
+        if not hum or not root or not head or hum.Health <= 0 then hideAll(e); continue end
+        if SETTINGS.TeamCheck and plr.Team == LocalPlayer.Team then hideAll(e); continue end
+
+        local topPos, topOn = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.5, 0))
+        local botPos, botOn = Camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+        if not (topOn and botOn) then hideAll(e); continue end
+
+        local h = math.abs(botPos.Y - topPos.Y)
+        local w = h * 0.55
+        local x = topPos.X - w / 2
+        local y = topPos.Y
+
+        e.box.Size, e.box.Position, e.box.Color, e.box.Visible =
+            Vector2.new(w, h), Vector2.new(x, y), SETTINGS.ESPColor, true
+
+        e.name.Text     = plr.Name
+        e.name.Position = Vector2.new(topPos.X, y - 16)
+        e.name.Color    = SETTINGS.TextColor
+        e.name.Visible  = true
+
+        local dStuds = math.floor((root.Position - Camera.CFrame.Position).Magnitude)
+        e.dist.Text     = tostring(dStuds) .. "m"
+        e.dist.Position = Vector2.new(topPos.X, y + h + 2)
+        e.dist.Color    = SETTINGS.TextColor
+        e.dist.Visible  = true
+
+        local ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+        local barH  = h * ratio
+        e.hp.Size     = Vector2.new(2, barH)
+        e.hp.Position = Vector2.new(x - 4, y + (h - barH))
+        e.hp.Color    = SETTINGS.HealthColor
+        e.hp.Visible  = true
+    end
+end
+
+--// ===== TARGET SELECTION =====
+local function pickTarget()
+    local vp     = Camera.ViewportSize
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    local best, bestDist = nil, SETTINGS.FOV
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        if SETTINGS.TeamCheck and plr.Team == LocalPlayer.Team then continue end
+        local char = plr.Character
+        if not char then continue end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+
+        local part = char:FindFirstChild(SETTINGS.AimPart) or char:FindFirstChild("HumanoidRootPart")
+        if not part then continue end
+
+        local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if not onScreen then continue end
+
+        local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+        if d < bestDist then bestDist, best = d, part end
+    end
+    return best
+end
+
+--// ===== SILENT AIM HOOK =====
+local mt       = getrawmetatable(game)
+local oldIndex = mt.__index
+local oldCall  = mt.__namecall
+setreadonly(mt, false)
+
+mt.__index = newcclosure(function(self, key)
+    if Running and SETTINGS.SilentAim and self == Mouse and CachedTarget then
+        if key == "Hit"    then return CFrame.new(CachedTarget.Position) end
+        if key == "Target" then return CachedTarget end
+        if key == "UnitRay" then
+            return Ray.new(Camera.CFrame.Position, (CachedTarget.Position - Camera.CFrame.Position).Unit * 5000)
+        end
+    end
+    return oldIndex(self, key)
+end)
+
+mt.__namecall = newcclosure(function(self, ...)
+    if Running and SETTINGS.SilentAim and CachedTarget then
+        local m = getnamecallmethod()
+        if m == "FindPartOnRay" or m == "FindPartOnRayWithIgnoreList" or m == "FindPartOnRayWithWhitelist" then
+            local args   = { ... }
+            local origin = Camera.CFrame.Position
+            args[1] = Ray.new(origin, (CachedTarget.Position - origin).Unit * 5000)
+            return oldCall(self, table.unpack(args))
+        end
+    end
+    return oldCall(self, ...)
+end)
+
+setreadonly(mt, true)
+
+--// ===== AIMLOCK =====
+local function updateAimlock()
+    if not SETTINGS.AimLock or not HoldingAim or not CachedTarget then return end
+    local camPos  = Camera.CFrame.Position
+    local desired = CFrame.lookAt(camPos, CachedTarget.Position)
+    Camera.CFrame = Camera.CFrame:Lerp(desired, SETTINGS.AimSmoothness)
+end
+
+--// ===== HITBOX =====
+local function applyHitbox(plr)
+    local char = plr.Character
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and HITBOX_PARTS[part.Name] then
+            if not part:GetAttribute("TD_OrigSize") then
+                part:SetAttribute("TD_OrigSize", part.Size)
+                if SETTINGS.ShowHitbox then
+                    part:SetAttribute("TD_OrigTrans", part.Transparency)
+                    part.Transparency = 0.6
+                end
+            end
+            if part:GetAttribute("TD_AppliedScale") ~= SETTINGS.HitboxScale then
+                part.Size = part:GetAttribute("TD_OrigSize") * SETTINGS.HitboxScale
+                part:SetAttribute("TD_AppliedScale", SETTINGS.HitboxScale)
+            end
+        end
+    end
+end
+
+local function restoreHitbox(plr)
+    local char = plr.Character
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and part:GetAttribute("TD_OrigSize") then
+            part.Size = part:GetAttribute("TD_OrigSize")
+            part:SetAttribute("TD_OrigSize", nil)
+            part:SetAttribute("TD_AppliedScale", nil)
+            if part:GetAttribute("TD_OrigTrans") ~= nil then
+                part.Transparency = part:GetAttribute("TD_OrigTrans")
+                part:SetAttribute("TD_OrigTrans", nil)
+            end
+        end
+    end
+end
+
+local function updateHitbox()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        if SETTINGS.TeamCheck and plr.Team == LocalPlayer.Team then continue end
+        if SETTINGS.Hitbox then applyHitbox(plr) else restoreHitbox(plr) end
+    end
+end
+
+--// ===== UI =====
+local uiParent
+pcall(function() uiParent = CoreGui end)
+if not uiParent then uiParent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local screen = Instance.new("ScreenGui")
+screen.Name           = "TuandominoHack_" .. tostring(math.random(1, 1e6))
+screen.ResetOnSpawn    = false
+screen.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+screen.Parent          = uiParent
+
+local panel = Instance.new("Frame")
+panel.Size                = UDim2.new(0, 220, 0, 400)
+panel.Position            = UDim2.new(0, 20, 0, 60)
+panel.BackgroundColor3    = Color3.fromRGB(18, 18, 20)
+panel.BackgroundTransparency = 0.1
+panel.BorderSizePixel     = 0
+panel.Active              = true
+panel.Draggable           = true
+panel.Parent              = screen
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 28)
+title.BackgroundTransparency = 1
+title.Text = "Tuandomino Hack"
+title.TextColor3 = Color3.fromRGB(0, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Parent = panel
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -8, 1, -34)
+scroll.Position = UDim2.new(0, 4, 0, 30)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.CanvasSize = UDim2.new(0, 0, 0, 480)
+scroll.Parent = panel
+
+local function makeToggle(key, label, y)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 0, 30)
+    btn.Position = UDim2.new(0, 4, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 32, 36)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 12
+    btn.Parent = scroll
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local function refresh()
+        btn.Text = label .. ": " .. (SETTINGS[key] and "ON" or "OFF")
+        btn.TextColor3 = SETTINGS[key]
+            and Color3.fromRGB(120, 255, 120)
+            or Color3.fromRGB(255, 120, 120)
+    end
+    refresh()
+    btn.MouseButton1Click:Connect(function() SETTINGS[key] = not SETTINGS[key]; refresh() end)
+end
+
+local function makeStepper(label, key, step, min, max, y, fmt)
+    fmt = fmt or function(v) return tostring(v) end
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -8, 0, 30)
+    row.Position = UDim2.new(0, 4, 0, y)
+    row.BackgroundColor3 = Color3.fromRGB(32, 32, 36)
+    row.BorderSizePixel = 0
+    row.Parent = scroll
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local minus = Instance.new("TextButton")
+    minus.Size = UDim2.new(0, 32, 1, 0)
+    minus.BackgroundTransparency = 1
+    minus.Text = "-"
+    minus.TextColor3 = Color3.fromRGB(255, 100, 100)
+    minus.Font = Enum.Font.GothamBold
+    minus.TextSize = 18
+    minus.Parent = row
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -64, 1, 0)
+    lbl.Position = UDim2.new(0, 32, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 12
+    lbl.Parent = row
+
+    local plus = Instance.new("TextButton")
+    plus.Size = UDim2.new(0, 32, 1, 0)
+    plus.Position = UDim2.new(1, -32, 0, 0)
+    plus.BackgroundTransparency = 1
+    plus.Text = "+"
+    plus.TextColor3 = Color3.fromRGB(100, 255, 100)
+    plus.Font = Enum.Font.GothamBold
+    plus.TextSize = 18
+    plus.Parent = row
+
+    local function refresh() lbl.Text = label .. ": " .. fmt(SETTINGS[key]) end
+    refresh()
+    minus.MouseButton1Click:Connect(function()
+        SETTINGS[key] = math.max(min, SETTINGS[key] - step); refresh()
+    end)
+    plus.MouseButton1Click:Connect(function()
+        SETTINGS[key] = math.min(max, SETTINGS[key] + step); refresh()
+    end)
+end
+
+makeToggle("ESP",       "ESP",        4)
+makeToggle("SilentAim", "Silent Aim", 38)
+makeToggle("AimLock",   "AimLock",    72)
+makeToggle("Hitbox",    "Hitbox",     106)
+makeToggle("TeamCheck", "Team Check", 140)
+makeToggle("ShowHitbox","Show Hitbox",174)
+makeStepper("FOV",        "FOV",           25, 50,  800, 212)
+makeStepper("Smooth",     "AimSmooth",   0.05, 0.05, 1, 246, function(v) return string.format("%.2f", v) end)
+makeStepper("HitboxScale","Hitbox Scale", 0.25, 1.0, 4.0, 280, function(v) return string.format("%.2fx", v) end)
+
+-- AIM hold button
+local aimBtn = Instance.new("TextButton")
+aimBtn.Size = UDim2.new(0, 78, 0, 78)
+aimBtn.Position = UDim2.new(1, -100, 1, -160)
+aimBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+aimBtn.BackgroundTransparency = 0.25
+aimBtn.Text = "AIM"
+aimBtn.TextColor3 = Color3.fromRGB(0, 255, 255)
+aimBtn.Font = Enum.Font.GothamBold
+aimBtn.TextSize = 16
+aimBtn.Parent = screen
+Instance.new("UICorner", aimBtn).CornerRadius = UDim.new(1, 0)
+
+aimBtn.MouseButton1Down:Connect(function() HoldingAim = true;  aimBtn.TextColor3 = Color3.fromRGB(120, 255, 120) end)
+aimBtn.MouseButton1Up:Connect(function()   HoldingAim = false; aimBtn.TextColor3 = Color3.fromRGB(0, 255, 255) end)
+
+--// ===== WIRING =====
+for _, plr in ipairs(Players:GetPlayers()) do newESP(plr) end
+addConn(Players.PlayerAdded:Connect(newESP))
+addConn(Players.PlayerRemoving:Connect(removeESP))
+
+addConn(RunService.RenderStepped:Connect(function()
+    if not Running then return end
+    updateESP()
+    CachedTarget = pickTarget()
+    updateAimlock()
+    updateHitbox()
+end))
+
+--// ===== CLEANUP =====
+getgenv().TD_Unload = function()
+    Running = false
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    for plr in pairs(ESPCache) do removeESP(plr) end
+    for _, plr in ipairs(Players:GetPlayers()) do restoreHitbox(plr) end
+    pcall(function() screen:Destroy() end)
+    setreadonly(mt, false)
+    mt.__index    = oldIndex
+    mt.__namecall = oldCall
+    setreadonly(mt, true)
+end
+
+print("[Tuandomino Hack] loaded — panel top-left, AIM button bottom-right")
